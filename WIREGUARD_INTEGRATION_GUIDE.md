@@ -193,213 +193,34 @@ echo "Public Key:  $PUBLIC_KEY"
 
 ---
 
-### Method 3: Using C# with Windows BCrypt APIs
+### Method 3: Using C# with Built-in .NET Cryptography
 
-C# can generate WireGuard keys using the Windows BCrypt (Cryptography API: Next Generation) through P/Invoke. This is the native Windows approach with no external dependencies.
+C# can generate WireGuard keys using the built-in `ECDiffieHellman` class with Curve25519 support. This is the simplest approach with zero external dependencies.
 
-#### Complete BCrypt Implementation:
+#### Complete .NET Implementation:
 
 ```csharp
 using System;
-using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 
 public static class WireGuardKeyGenerator
 {
-    // BCrypt Algorithm Identifiers
-    private const string BCRYPT_ECDH_ALGORITHM = "ECDH";
-    private const string BCRYPT_ECC_CURVE_25519 = "curve25519";
-
-    // BCrypt flags
-    private const uint BCRYPT_ECDH_PUBLIC_GENERIC_MAGIC = 0x504B4345;
-    private const uint BCRYPT_ECDH_PRIVATE_GENERIC_MAGIC = 0x564B4345;
-
-    // Property strings
-    private const string BCRYPT_ECC_CURVE_NAME = "ECCCurveName";
-
-    // Blob types
-    private const string BCRYPT_ECCPUBLIC_BLOB = "ECCPUBLICBLOB";
-    private const string BCRYPT_ECCPRIVATE_BLOB = "ECCPRIVATEBLOB";
-
-    #region P/Invoke Declarations
-
-    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
-    private static extern uint BCryptOpenAlgorithmProvider(
-        out IntPtr phAlgorithm,
-        string pszAlgId,
-        string pszImplementation,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll")]
-    private static extern uint BCryptCloseAlgorithmProvider(
-        IntPtr hAlgorithm,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
-    private static extern uint BCryptSetProperty(
-        IntPtr hObject,
-        string pszProperty,
-        byte[] pbInput,
-        uint cbInput,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll")]
-    private static extern uint BCryptGenerateKeyPair(
-        IntPtr hAlgorithm,
-        out IntPtr phKey,
-        uint dwLength,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll")]
-    private static extern uint BCryptFinalizeKeyPair(
-        IntPtr hKey,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll")]
-    private static extern uint BCryptExportKey(
-        IntPtr hKey,
-        IntPtr hExportKey,
-        string pszBlobType,
-        byte[] pbOutput,
-        uint cbOutput,
-        out uint pcbResult,
-        uint dwFlags);
-
-    [DllImport("bcrypt.dll")]
-    private static extern uint BCryptDestroyKey(
-        IntPtr hKey);
-
-    #endregion
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct BCRYPT_ECCKEY_BLOB
-    {
-        public uint dwMagic;
-        public uint cbKey;
-    }
-
     public static (string privateKey, string publicKey) GenerateKeys()
     {
-        IntPtr algHandle = IntPtr.Zero;
-        IntPtr keyHandle = IntPtr.Zero;
+        byte[] privateKeyBytes;
+        byte[] publicKeyBytes;
 
-        try
+        using (ECDiffieHellman algorithm = ECDiffieHellman.Create(ECCurve.CreateFromFriendlyName("Curve25519")))
         {
-            // Open algorithm provider for ECDH
-            uint status = BCryptOpenAlgorithmProvider(
-                out algHandle,
-                BCRYPT_ECDH_ALGORITHM,
-                null,
-                0);
-
-            if (status != 0)
-                throw new InvalidOperationException($"BCryptOpenAlgorithmProvider failed: 0x{status:X}");
-
-            // Set the curve to Curve25519
-            byte[] curveNameBytes = System.Text.Encoding.Unicode.GetBytes(BCRYPT_ECC_CURVE_25519 + "\0");
-            status = BCryptSetProperty(
-                algHandle,
-                BCRYPT_ECC_CURVE_NAME,
-                curveNameBytes,
-                (uint)curveNameBytes.Length,
-                0);
-
-            if (status != 0)
-                throw new InvalidOperationException($"BCryptSetProperty failed: 0x{status:X}");
-
-            // Generate key pair (256 bits = 32 bytes for Curve25519)
-            status = BCryptGenerateKeyPair(
-                algHandle,
-                out keyHandle,
-                256,
-                0);
-
-            if (status != 0)
-                throw new InvalidOperationException($"BCryptGenerateKeyPair failed: 0x{status:X}");
-
-            // Finalize the key pair
-            status = BCryptFinalizeKeyPair(keyHandle, 0);
-            if (status != 0)
-                throw new InvalidOperationException($"BCryptFinalizeKeyPair failed: 0x{status:X}");
-
-            // Export public key
-            byte[] publicKeyBlob = ExportKey(keyHandle, BCRYPT_ECCPUBLIC_BLOB);
-            byte[] publicKeyBytes = ExtractPublicKey(publicKeyBlob);
-            string publicKey = Convert.ToBase64String(publicKeyBytes);
-
-            // Export private key
-            byte[] privateKeyBlob = ExportKey(keyHandle, BCRYPT_ECCPRIVATE_BLOB);
-            byte[] privateKeyBytes = ExtractPrivateKey(privateKeyBlob);
-            string privateKey = Convert.ToBase64String(privateKeyBytes);
-
-            return (privateKey, publicKey);
+            ECParameters ecp = algorithm.ExportParameters(true);
+            privateKeyBytes = ecp.D!;
+            publicKeyBytes = ecp.Q.X!;
         }
-        finally
-        {
-            if (keyHandle != IntPtr.Zero)
-                BCryptDestroyKey(keyHandle);
 
-            if (algHandle != IntPtr.Zero)
-                BCryptCloseAlgorithmProvider(algHandle, 0);
-        }
-    }
+        string privateKey = Convert.ToBase64String(privateKeyBytes);
+        string publicKey = Convert.ToBase64String(publicKeyBytes);
 
-    private static byte[] ExportKey(IntPtr keyHandle, string blobType)
-    {
-        // Get the size of the blob
-        uint blobSize;
-        uint status = BCryptExportKey(
-            keyHandle,
-            IntPtr.Zero,
-            blobType,
-            null,
-            0,
-            out blobSize,
-            0);
-
-        if (status != 0)
-            throw new InvalidOperationException($"BCryptExportKey (size) failed: 0x{status:X}");
-
-        // Export the key
-        byte[] blob = new byte[blobSize];
-        status = BCryptExportKey(
-            keyHandle,
-            IntPtr.Zero,
-            blobType,
-            blob,
-            blobSize,
-            out blobSize,
-            0);
-
-        if (status != 0)
-            throw new InvalidOperationException($"BCryptExportKey failed: 0x{status:X}");
-
-        return blob;
-    }
-
-    private static byte[] ExtractPublicKey(byte[] blob)
-    {
-        // Blob structure: BCRYPT_ECCKEY_BLOB header + public key (32 bytes)
-        int headerSize = Marshal.SizeOf<BCRYPT_ECCKEY_BLOB>();
-
-        if (blob.Length < headerSize + 32)
-            throw new InvalidOperationException("Invalid public key blob size");
-
-        byte[] publicKey = new byte[32];
-        Array.Copy(blob, headerSize, publicKey, 0, 32);
-        return publicKey;
-    }
-
-    private static byte[] ExtractPrivateKey(byte[] blob)
-    {
-        // Blob structure: BCRYPT_ECCKEY_BLOB header + public key (32 bytes) + private key (32 bytes)
-        int headerSize = Marshal.SizeOf<BCRYPT_ECCKEY_BLOB>();
-
-        if (blob.Length < headerSize + 64)
-            throw new InvalidOperationException("Invalid private key blob size");
-
-        byte[] privateKey = new byte[32];
-        Array.Copy(blob, headerSize + 32, privateKey, 0, 32);
-        return privateKey;
+        return (privateKey, publicKey);
     }
 
     // Example usage
@@ -412,7 +233,7 @@ public static class WireGuardKeyGenerator
     }
 }
 
-#### Complete C# PIA WireGuard Client with BCrypt:
+#### Complete C# PIA WireGuard Client:
 
 ```csharp
 using System;
@@ -617,7 +438,7 @@ Public:  6B8CHk2KNqRFqR4F3R3Z9Y7W9Y7EpqG=
 |--------|------|------|
 | **WireGuard CLI** | Simple, guaranteed compatible | Requires WireGuard tools installed |
 | **OpenSSL** | Available on most systems | Requires OpenSSL 1.1.0+ |
-| **C# BCrypt** | Native Windows API, no dependencies | Windows only, requires P/Invoke |
+| **C# .NET** | Built-in, no dependencies, cross-platform | Requires .NET 5+ for Curve25519 |
 
 ---
 

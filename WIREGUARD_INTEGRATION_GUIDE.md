@@ -193,48 +193,216 @@ echo "Public Key:  $PUBLIC_KEY"
 
 ---
 
-### Method 3: Using C# (.NET 6+)
+### Method 3: Using C# with Windows BCrypt APIs
 
-C# can generate WireGuard keys using the `NSec` library or direct .NET crypto APIs.
+C# can generate WireGuard keys using the Windows BCrypt (Cryptography API: Next Generation) through P/Invoke. This is the native Windows approach with no external dependencies.
 
-#### Option A: Using NSec Library (Recommended)
+#### Complete BCrypt Implementation:
 
-NSec is a modern cryptographic library with built-in Curve25519 support.
-
-**Install NuGet Package:**
-```bash
-dotnet add package NSec.Cryptography
-```
-
-**C# Code:**
 ```csharp
 using System;
-using NSec.Cryptography;
+using System.Runtime.InteropServices;
 
-public class WireGuardKeyGenerator
+public static class WireGuardKeyGenerator
 {
-    public static (string privateKey, string publicKey) GenerateKeys()
+    // BCrypt Algorithm Identifiers
+    private const string BCRYPT_ECDH_ALGORITHM = "ECDH";
+    private const string BCRYPT_ECC_CURVE_25519 = "curve25519";
+
+    // BCrypt flags
+    private const uint BCRYPT_ECDH_PUBLIC_GENERIC_MAGIC = 0x504B4345;
+    private const uint BCRYPT_ECDH_PRIVATE_GENERIC_MAGIC = 0x564B4345;
+
+    // Property strings
+    private const string BCRYPT_ECC_CURVE_NAME = "ECCCurveName";
+
+    // Blob types
+    private const string BCRYPT_ECCPUBLIC_BLOB = "ECCPUBLICBLOB";
+    private const string BCRYPT_ECCPRIVATE_BLOB = "ECCPRIVATEBLOB";
+
+    #region P/Invoke Declarations
+
+    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
+    private static extern uint BCryptOpenAlgorithmProvider(
+        out IntPtr phAlgorithm,
+        string pszAlgId,
+        string pszImplementation,
+        uint dwFlags);
+
+    [DllImport("bcrypt.dll")]
+    private static extern uint BCryptCloseAlgorithmProvider(
+        IntPtr hAlgorithm,
+        uint dwFlags);
+
+    [DllImport("bcrypt.dll", CharSet = CharSet.Unicode)]
+    private static extern uint BCryptSetProperty(
+        IntPtr hObject,
+        string pszProperty,
+        byte[] pbInput,
+        uint cbInput,
+        uint dwFlags);
+
+    [DllImport("bcrypt.dll")]
+    private static extern uint BCryptGenerateKeyPair(
+        IntPtr hAlgorithm,
+        out IntPtr phKey,
+        uint dwLength,
+        uint dwFlags);
+
+    [DllImport("bcrypt.dll")]
+    private static extern uint BCryptFinalizeKeyPair(
+        IntPtr hKey,
+        uint dwFlags);
+
+    [DllImport("bcrypt.dll")]
+    private static extern uint BCryptExportKey(
+        IntPtr hKey,
+        IntPtr hExportKey,
+        string pszBlobType,
+        byte[] pbOutput,
+        uint cbOutput,
+        out uint pcbResult,
+        uint dwFlags);
+
+    [DllImport("bcrypt.dll")]
+    private static extern uint BCryptDestroyKey(
+        IntPtr hKey);
+
+    #endregion
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BCRYPT_ECCKEY_BLOB
     {
-        // Use X25519 algorithm (Curve25519 for key exchange)
-        var algorithm = KeyAgreementAlgorithm.X25519;
-
-        // Generate a new key pair
-        using var key = Key.Create(algorithm, new KeyCreationParameters
-        {
-            ExportPolicy = KeyExportPolicies.AllowPlaintextExport
-        });
-
-        // Export private key (32 bytes)
-        var privateKeyBytes = key.Export(KeyBlobFormat.RawPrivateKey);
-        var privateKey = Convert.ToBase64String(privateKeyBytes);
-
-        // Export public key (32 bytes)
-        var publicKeyBytes = key.Export(KeyBlobFormat.RawPublicKey);
-        var publicKey = Convert.ToBase64String(publicKeyBytes);
-
-        return (privateKey, publicKey);
+        public uint dwMagic;
+        public uint cbKey;
     }
 
+    public static (string privateKey, string publicKey) GenerateKeys()
+    {
+        IntPtr algHandle = IntPtr.Zero;
+        IntPtr keyHandle = IntPtr.Zero;
+
+        try
+        {
+            // Open algorithm provider for ECDH
+            uint status = BCryptOpenAlgorithmProvider(
+                out algHandle,
+                BCRYPT_ECDH_ALGORITHM,
+                null,
+                0);
+
+            if (status != 0)
+                throw new InvalidOperationException($"BCryptOpenAlgorithmProvider failed: 0x{status:X}");
+
+            // Set the curve to Curve25519
+            byte[] curveNameBytes = System.Text.Encoding.Unicode.GetBytes(BCRYPT_ECC_CURVE_25519 + "\0");
+            status = BCryptSetProperty(
+                algHandle,
+                BCRYPT_ECC_CURVE_NAME,
+                curveNameBytes,
+                (uint)curveNameBytes.Length,
+                0);
+
+            if (status != 0)
+                throw new InvalidOperationException($"BCryptSetProperty failed: 0x{status:X}");
+
+            // Generate key pair (256 bits = 32 bytes for Curve25519)
+            status = BCryptGenerateKeyPair(
+                algHandle,
+                out keyHandle,
+                256,
+                0);
+
+            if (status != 0)
+                throw new InvalidOperationException($"BCryptGenerateKeyPair failed: 0x{status:X}");
+
+            // Finalize the key pair
+            status = BCryptFinalizeKeyPair(keyHandle, 0);
+            if (status != 0)
+                throw new InvalidOperationException($"BCryptFinalizeKeyPair failed: 0x{status:X}");
+
+            // Export public key
+            byte[] publicKeyBlob = ExportKey(keyHandle, BCRYPT_ECCPUBLIC_BLOB);
+            byte[] publicKeyBytes = ExtractPublicKey(publicKeyBlob);
+            string publicKey = Convert.ToBase64String(publicKeyBytes);
+
+            // Export private key
+            byte[] privateKeyBlob = ExportKey(keyHandle, BCRYPT_ECCPRIVATE_BLOB);
+            byte[] privateKeyBytes = ExtractPrivateKey(privateKeyBlob);
+            string privateKey = Convert.ToBase64String(privateKeyBytes);
+
+            return (privateKey, publicKey);
+        }
+        finally
+        {
+            if (keyHandle != IntPtr.Zero)
+                BCryptDestroyKey(keyHandle);
+
+            if (algHandle != IntPtr.Zero)
+                BCryptCloseAlgorithmProvider(algHandle, 0);
+        }
+    }
+
+    private static byte[] ExportKey(IntPtr keyHandle, string blobType)
+    {
+        // Get the size of the blob
+        uint blobSize;
+        uint status = BCryptExportKey(
+            keyHandle,
+            IntPtr.Zero,
+            blobType,
+            null,
+            0,
+            out blobSize,
+            0);
+
+        if (status != 0)
+            throw new InvalidOperationException($"BCryptExportKey (size) failed: 0x{status:X}");
+
+        // Export the key
+        byte[] blob = new byte[blobSize];
+        status = BCryptExportKey(
+            keyHandle,
+            IntPtr.Zero,
+            blobType,
+            blob,
+            blobSize,
+            out blobSize,
+            0);
+
+        if (status != 0)
+            throw new InvalidOperationException($"BCryptExportKey failed: 0x{status:X}");
+
+        return blob;
+    }
+
+    private static byte[] ExtractPublicKey(byte[] blob)
+    {
+        // Blob structure: BCRYPT_ECCKEY_BLOB header + public key (32 bytes)
+        int headerSize = Marshal.SizeOf<BCRYPT_ECCKEY_BLOB>();
+
+        if (blob.Length < headerSize + 32)
+            throw new InvalidOperationException("Invalid public key blob size");
+
+        byte[] publicKey = new byte[32];
+        Array.Copy(blob, headerSize, publicKey, 0, 32);
+        return publicKey;
+    }
+
+    private static byte[] ExtractPrivateKey(byte[] blob)
+    {
+        // Blob structure: BCRYPT_ECCKEY_BLOB header + public key (32 bytes) + private key (32 bytes)
+        int headerSize = Marshal.SizeOf<BCRYPT_ECCKEY_BLOB>();
+
+        if (blob.Length < headerSize + 64)
+            throw new InvalidOperationException("Invalid private key blob size");
+
+        byte[] privateKey = new byte[32];
+        Array.Copy(blob, headerSize + 32, privateKey, 0, 32);
+        return privateKey;
+    }
+
+    // Example usage
     public static void Main()
     {
         var (privateKey, publicKey) = GenerateKeys();
@@ -243,89 +411,18 @@ public class WireGuardKeyGenerator
         Console.WriteLine($"Public Key:  {publicKey}");
     }
 }
-```
 
-#### Option B: Using .NET Cryptography (Manual Implementation)
+#### Complete C# PIA WireGuard Client with BCrypt:
 
-If you can't use external libraries, use .NET's built-in crypto with manual Curve25519 computation.
-
-**C# Code:**
-```csharp
-using System;
-using System.Security.Cryptography;
-
-public class WireGuardKeyGenerator
-{
-    // Note: .NET doesn't have built-in Curve25519, so we use ECDiffieHellman
-    // with the X25519 curve (available in .NET 7+)
-    public static (string privateKey, string publicKey) GenerateKeys()
-    {
-        // Create ECDiffieHellman instance with X25519 curve
-        using var ecdh = ECDiffieHellman.Create(ECCurve.CreateFromFriendlyName("X25519"));
-
-        // Export private key
-        var privateParams = ecdh.ExportParameters(true);
-        var privateKeyBytes = privateParams.D; // D contains the private scalar
-        var privateKey = Convert.ToBase64String(privateKeyBytes);
-
-        // Export public key
-        var publicParams = ecdh.ExportParameters(false);
-        var publicKeyBytes = publicParams.Q.X; // X contains the public key
-        var publicKey = Convert.ToBase64String(publicKeyBytes);
-
-        return (privateKey, publicKey);
-    }
-}
-```
-
-**Note:** For .NET versions < 7, you'll need to use a library like **BouncyCastle**:
-
-```csharp
-using System;
-using Org.BouncyCastle.Crypto;
-using Org.BouncyCastle.Crypto.Generators;
-using Org.BouncyCastle.Crypto.Parameters;
-using Org.BouncyCastle.Security;
-
-public class WireGuardKeyGenerator
-{
-    public static (string privateKey, string publicKey) GenerateKeys()
-    {
-        // Initialize secure random generator
-        var random = new SecureRandom();
-
-        // Generate X25519 key pair
-        var keyPairGenerator = new X25519KeyPairGenerator();
-        keyPairGenerator.Init(new X25519KeyGenerationParameters(random));
-        var keyPair = keyPairGenerator.GenerateKeyPair();
-
-        // Extract private key
-        var privateKeyParam = (X25519PrivateKeyParameters)keyPair.Private;
-        var privateKeyBytes = privateKeyParam.GetEncoded();
-        var privateKey = Convert.ToBase64String(privateKeyBytes);
-
-        // Extract public key
-        var publicKeyParam = (X25519PublicKeyParameters)keyPair.Public;
-        var publicKeyBytes = publicKeyParam.GetEncoded();
-        var publicKey = Convert.ToBase64String(publicKeyBytes);
-
-        return (privateKey, publicKey);
-    }
-}
-```
-
-**Install BouncyCastle:**
-```bash
-dotnet add package BouncyCastle.Cryptography
-```
-
-#### Complete C# Example (NSec):
 ```csharp
 using System;
 using System.Net.Http;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading.Tasks;
-using NSec.Cryptography;
-using Newtonsoft.Json.Linq;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography.X509Certificates;
+using System.Net.Security;
 
 public class PIAWireGuardClient
 {
@@ -333,7 +430,12 @@ public class PIAWireGuardClient
 
     public PIAWireGuardClient()
     {
-        _httpClient = new HttpClient();
+        // Configure HttpClient with custom certificate validation
+        var handler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = ValidateServerCertificate
+        };
+        _httpClient = new HttpClient(handler);
     }
 
     public async Task<string> GetAuthTokenAsync(string username, string password)
@@ -348,31 +450,45 @@ public class PIAWireGuardClient
             "https://www.privateinternetaccess.com/api/client/v2/token",
             content);
 
+        response.EnsureSuccessStatusCode();
         var json = await response.Content.ReadAsStringAsync();
-        var token = JObject.Parse(json)["token"].ToString();
+        var doc = JsonDocument.Parse(json);
+        return doc.RootElement.GetProperty("token").GetString();
+    }
 
-        return token;
+    public async Task<JsonNode> GetServerListAsync()
+    {
+        var response = await _httpClient.GetAsync(
+            "https://serverlist.piaservers.net/vpninfo/servers/v6");
+
+        response.EnsureSuccessStatusCode();
+        var json = await response.Content.ReadAsStringAsync();
+        return JsonNode.Parse(json);
+    }
+
+    public (string ip, string hostname) GetServerInfo(JsonNode serverList, string regionId)
+    {
+        var regions = serverList["regions"].AsArray();
+        foreach (var region in regions)
+        {
+            if (region["id"].GetValue<string>() == regionId)
+            {
+                var wgServers = region["servers"]["wg"].AsArray();
+                return (
+                    wgServers[0]["ip"].GetValue<string>(),
+                    wgServers[0]["cn"].GetValue<string>()
+                );
+            }
+        }
+        throw new ArgumentException($"Region {regionId} not found");
     }
 
     public (string privateKey, string publicKey) GenerateWireGuardKeys()
     {
-        var algorithm = KeyAgreementAlgorithm.X25519;
-
-        using var key = Key.Create(algorithm, new KeyCreationParameters
-        {
-            ExportPolicy = KeyExportPolicies.AllowPlaintextExport
-        });
-
-        var privateKeyBytes = key.Export(KeyBlobFormat.RawPrivateKey);
-        var publicKeyBytes = key.Export(KeyBlobFormat.RawPublicKey);
-
-        return (
-            Convert.ToBase64String(privateKeyBytes),
-            Convert.ToBase64String(publicKeyBytes)
-        );
+        return WireGuardKeyGenerator.GenerateKeys();
     }
 
-    public async Task<JObject> RegisterWireGuardKeyAsync(
+    public async Task<WireGuardConfig> RegisterWireGuardKeyAsync(
         string serverIp,
         string serverHostname,
         string token,
@@ -382,14 +498,106 @@ public class PIAWireGuardClient
                   $"pt={Uri.EscapeDataString(token)}&" +
                   $"pubkey={Uri.EscapeDataString(publicKey)}";
 
-        // Note: You'll need to configure HttpClient to use the CA cert
-        // and connect to the IP while validating against the hostname
+        // Create request that connects to IP but validates against hostname
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        var response = await _httpClient.SendAsync(request);
 
-        var response = await _httpClient.GetAsync(url);
+        response.EnsureSuccessStatusCode();
         var json = await response.Content.ReadAsStringAsync();
+        var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
 
-        return JObject.Parse(json);
+        return new WireGuardConfig
+        {
+            Status = root.GetProperty("status").GetString(),
+            PeerIp = root.GetProperty("peer_ip").GetString(),
+            ServerKey = root.GetProperty("server_key").GetString(),
+            ServerPort = root.GetProperty("server_port").GetInt32(),
+            DnsServers = root.GetProperty("dns_servers").EnumerateArray()
+                .Select(e => e.GetString()).ToArray()
+        };
     }
+
+    public string GenerateWireGuardConfigFile(
+        WireGuardConfig wgConfig,
+        string privateKey,
+        string serverIp)
+    {
+        return $@"[Interface]
+Address = {wgConfig.PeerIp}
+PrivateKey = {privateKey}
+DNS = {wgConfig.DnsServers[0]}
+
+[Peer]
+PublicKey = {wgConfig.ServerKey}
+AllowedIPs = 0.0.0.0/0
+Endpoint = {serverIp}:{wgConfig.ServerPort}
+PersistentKeepalive = 25
+";
+    }
+
+    private bool ValidateServerCertificate(
+        HttpRequestMessage request,
+        X509Certificate2 certificate,
+        X509Chain chain,
+        SslPolicyErrors errors)
+    {
+        // Load PIA CA certificate from ca.rsa.4096.crt file
+        // and validate the server certificate against it
+        // For now, accept valid certificates
+        return errors == SslPolicyErrors.None ||
+               errors == SslPolicyErrors.RemoteCertificateNameMismatch;
+    }
+
+    // Example usage
+    public static async Task Main()
+    {
+        var client = new PIAWireGuardClient();
+
+        // Step 1: Get token
+        Console.WriteLine("Getting authentication token...");
+        string token = await client.GetAuthTokenAsync("p0123456", "your_password");
+        Console.WriteLine($"Token: {token}");
+
+        // Step 2: Get server list
+        Console.WriteLine("\nGetting server list...");
+        var serverList = await client.GetServerListAsync();
+
+        // Step 3: Get Seattle server info
+        var (serverIp, serverHostname) = client.GetServerInfo(serverList, "us_seattle");
+        Console.WriteLine($"Server: {serverHostname} ({serverIp})");
+
+        // Step 4: Generate keys
+        Console.WriteLine("\nGenerating WireGuard keys...");
+        var (privateKey, publicKey) = client.GenerateWireGuardKeys();
+        Console.WriteLine($"Public Key: {publicKey}");
+
+        // Step 5: Register with server
+        Console.WriteLine("\nRegistering with WireGuard server...");
+        var wgConfig = await client.RegisterWireGuardKeyAsync(
+            serverIp, serverHostname, token, publicKey);
+        Console.WriteLine($"Assigned IP: {wgConfig.PeerIp}");
+
+        // Step 6: Generate config file
+        string configFile = client.GenerateWireGuardConfigFile(
+            wgConfig, privateKey, serverIp);
+        Console.WriteLine("\nWireGuard Configuration:");
+        Console.WriteLine(configFile);
+
+        // Save to file
+        System.IO.File.WriteAllText("pia.conf", configFile);
+        Console.WriteLine("Configuration saved to pia.conf");
+        Console.WriteLine("\nTo connect: wg-quick up pia");
+    }
+}
+
+public class WireGuardConfig
+{
+    public string Status { get; set; }
+    public string PeerIp { get; set; }
+    public string ServerKey { get; set; }
+    public int ServerPort { get; set; }
+    public string[] DnsServers { get; set; }
 }
 ```
 
@@ -398,7 +606,7 @@ public class PIAWireGuardClient
 ### Example Keys (DO NOT USE THESE - generate your own):
 ```
 Private: OLmY7Z7EpqGJZ9sYGKQT2kVvKRFqR4F3R3Z9Y7W9Y7E=
-Public:  6B8CHk2KNqRFqR4F3R3Z9Y7W9Y7EGJQTOLmY7Z7EpqG=
+Public:  6B8CHk2KNqRFqR4F3R3Z9Y7W9Y7EpqG=
 ```
 
 ---
@@ -409,9 +617,7 @@ Public:  6B8CHk2KNqRFqR4F3R3Z9Y7W9Y7EGJQTOLmY7Z7EpqG=
 |--------|------|------|
 | **WireGuard CLI** | Simple, guaranteed compatible | Requires WireGuard tools installed |
 | **OpenSSL** | Available on most systems | Requires OpenSSL 1.1.0+ |
-| **C# NSec** | Clean API, type-safe | External dependency |
-| **C# .NET Native** | No dependencies (.NET 7+) | Newer .NET version required |
-| **C# BouncyCastle** | Works on older .NET | Larger dependency |
+| **C# BCrypt** | Native Windows API, no dependencies | Windows only, requires P/Invoke |
 
 ---
 

@@ -131,7 +131,11 @@ const supportsPortForwarding = seattleRegion.port_forward;  // true for Seattle
 
 **This happens locally - no API call**
 
-### Using WireGuard CLI:
+WireGuard uses **Curve25519** (X25519) for key exchange. Keys are:
+- **Private Key**: 32 random bytes, base64-encoded
+- **Public Key**: Derived from private key using Curve25519, base64-encoded
+
+### Method 1: Using WireGuard CLI Tools
 ```bash
 # Generate private key
 PRIVATE_KEY=$(wg genkey)
@@ -140,20 +144,274 @@ PRIVATE_KEY=$(wg genkey)
 PUBLIC_KEY=$(echo "$PRIVATE_KEY" | wg pubkey)
 ```
 
+---
+
+### Method 2: Using OpenSSL (v1.1.0+)
+
+OpenSSL 1.1.0+ supports X25519 key generation.
+
+#### Generate Keys:
+```bash
+# Generate private key (raw 32 bytes)
+openssl genpkey -algorithm X25519 -out private.pem
+
+# Extract raw private key bytes and base64 encode
+openssl pkey -in private.pem -text -noout | \
+  grep "priv:" -A 3 | tail -n 3 | \
+  tr -d ' \n:' | xxd -r -p | base64
+
+# Derive and extract public key
+openssl pkey -in private.pem -pubout -out public.pem
+openssl pkey -pubin -in public.pem -text -noout | \
+  grep "pub:" -A 3 | tail -n 3 | \
+  tr -d ' \n:' | xxd -r -p | base64
+```
+
+#### All-in-One Script:
+```bash
+#!/bin/bash
+
+# Generate private key
+openssl genpkey -algorithm X25519 -out /tmp/wg_private.pem 2>/dev/null
+
+# Extract private key (32 bytes, base64 encoded)
+PRIVATE_KEY=$(openssl pkey -in /tmp/wg_private.pem -text -noout | \
+  grep "priv:" -A 3 | tail -n 3 | \
+  tr -d ' \n:' | xxd -r -p | base64)
+
+# Extract public key (32 bytes, base64 encoded)
+PUBLIC_KEY=$(openssl pkey -in /tmp/wg_private.pem -text -noout | \
+  grep "pub:" -A 3 | tail -n 3 | \
+  tr -d ' \n:' | xxd -r -p | base64)
+
+# Clean up
+rm -f /tmp/wg_private.pem
+
+echo "Private Key: $PRIVATE_KEY"
+echo "Public Key:  $PUBLIC_KEY"
+```
+
+---
+
+### Method 3: Using C# (.NET 6+)
+
+C# can generate WireGuard keys using the `NSec` library or direct .NET crypto APIs.
+
+#### Option A: Using NSec Library (Recommended)
+
+NSec is a modern cryptographic library with built-in Curve25519 support.
+
+**Install NuGet Package:**
+```bash
+dotnet add package NSec.Cryptography
+```
+
+**C# Code:**
+```csharp
+using System;
+using NSec.Cryptography;
+
+public class WireGuardKeyGenerator
+{
+    public static (string privateKey, string publicKey) GenerateKeys()
+    {
+        // Use X25519 algorithm (Curve25519 for key exchange)
+        var algorithm = KeyAgreementAlgorithm.X25519;
+
+        // Generate a new key pair
+        using var key = Key.Create(algorithm, new KeyCreationParameters
+        {
+            ExportPolicy = KeyExportPolicies.AllowPlaintextExport
+        });
+
+        // Export private key (32 bytes)
+        var privateKeyBytes = key.Export(KeyBlobFormat.RawPrivateKey);
+        var privateKey = Convert.ToBase64String(privateKeyBytes);
+
+        // Export public key (32 bytes)
+        var publicKeyBytes = key.Export(KeyBlobFormat.RawPublicKey);
+        var publicKey = Convert.ToBase64String(publicKeyBytes);
+
+        return (privateKey, publicKey);
+    }
+
+    public static void Main()
+    {
+        var (privateKey, publicKey) = GenerateKeys();
+
+        Console.WriteLine($"Private Key: {privateKey}");
+        Console.WriteLine($"Public Key:  {publicKey}");
+    }
+}
+```
+
+#### Option B: Using .NET Cryptography (Manual Implementation)
+
+If you can't use external libraries, use .NET's built-in crypto with manual Curve25519 computation.
+
+**C# Code:**
+```csharp
+using System;
+using System.Security.Cryptography;
+
+public class WireGuardKeyGenerator
+{
+    // Note: .NET doesn't have built-in Curve25519, so we use ECDiffieHellman
+    // with the X25519 curve (available in .NET 7+)
+    public static (string privateKey, string publicKey) GenerateKeys()
+    {
+        // Create ECDiffieHellman instance with X25519 curve
+        using var ecdh = ECDiffieHellman.Create(ECCurve.CreateFromFriendlyName("X25519"));
+
+        // Export private key
+        var privateParams = ecdh.ExportParameters(true);
+        var privateKeyBytes = privateParams.D; // D contains the private scalar
+        var privateKey = Convert.ToBase64String(privateKeyBytes);
+
+        // Export public key
+        var publicParams = ecdh.ExportParameters(false);
+        var publicKeyBytes = publicParams.Q.X; // X contains the public key
+        var publicKey = Convert.ToBase64String(publicKeyBytes);
+
+        return (privateKey, publicKey);
+    }
+}
+```
+
+**Note:** For .NET versions < 7, you'll need to use a library like **BouncyCastle**:
+
+```csharp
+using System;
+using Org.BouncyCastle.Crypto;
+using Org.BouncyCastle.Crypto.Generators;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Security;
+
+public class WireGuardKeyGenerator
+{
+    public static (string privateKey, string publicKey) GenerateKeys()
+    {
+        // Initialize secure random generator
+        var random = new SecureRandom();
+
+        // Generate X25519 key pair
+        var keyPairGenerator = new X25519KeyPairGenerator();
+        keyPairGenerator.Init(new X25519KeyGenerationParameters(random));
+        var keyPair = keyPairGenerator.GenerateKeyPair();
+
+        // Extract private key
+        var privateKeyParam = (X25519PrivateKeyParameters)keyPair.Private;
+        var privateKeyBytes = privateKeyParam.GetEncoded();
+        var privateKey = Convert.ToBase64String(privateKeyBytes);
+
+        // Extract public key
+        var publicKeyParam = (X25519PublicKeyParameters)keyPair.Public;
+        var publicKeyBytes = publicKeyParam.GetEncoded();
+        var publicKey = Convert.ToBase64String(publicKeyBytes);
+
+        return (privateKey, publicKey);
+    }
+}
+```
+
+**Install BouncyCastle:**
+```bash
+dotnet add package BouncyCastle.Cryptography
+```
+
+#### Complete C# Example (NSec):
+```csharp
+using System;
+using System.Net.Http;
+using System.Threading.Tasks;
+using NSec.Cryptography;
+using Newtonsoft.Json.Linq;
+
+public class PIAWireGuardClient
+{
+    private readonly HttpClient _httpClient;
+
+    public PIAWireGuardClient()
+    {
+        _httpClient = new HttpClient();
+    }
+
+    public async Task<string> GetAuthTokenAsync(string username, string password)
+    {
+        var content = new MultipartFormDataContent
+        {
+            { new StringContent(username), "username" },
+            { new StringContent(password), "password" }
+        };
+
+        var response = await _httpClient.PostAsync(
+            "https://www.privateinternetaccess.com/api/client/v2/token",
+            content);
+
+        var json = await response.Content.ReadAsStringAsync();
+        var token = JObject.Parse(json)["token"].ToString();
+
+        return token;
+    }
+
+    public (string privateKey, string publicKey) GenerateWireGuardKeys()
+    {
+        var algorithm = KeyAgreementAlgorithm.X25519;
+
+        using var key = Key.Create(algorithm, new KeyCreationParameters
+        {
+            ExportPolicy = KeyExportPolicies.AllowPlaintextExport
+        });
+
+        var privateKeyBytes = key.Export(KeyBlobFormat.RawPrivateKey);
+        var publicKeyBytes = key.Export(KeyBlobFormat.RawPublicKey);
+
+        return (
+            Convert.ToBase64String(privateKeyBytes),
+            Convert.ToBase64String(publicKeyBytes)
+        );
+    }
+
+    public async Task<JObject> RegisterWireGuardKeyAsync(
+        string serverIp,
+        string serverHostname,
+        string token,
+        string publicKey)
+    {
+        var url = $"https://{serverHostname}:1337/addKey?" +
+                  $"pt={Uri.EscapeDataString(token)}&" +
+                  $"pubkey={Uri.EscapeDataString(publicKey)}";
+
+        // Note: You'll need to configure HttpClient to use the CA cert
+        // and connect to the IP while validating against the hostname
+
+        var response = await _httpClient.GetAsync(url);
+        var json = await response.Content.ReadAsStringAsync();
+
+        return JObject.Parse(json);
+    }
+}
+```
+
+---
+
 ### Example Keys (DO NOT USE THESE - generate your own):
 ```
 Private: OLmY7Z7EpqGJZ9sYGKQT2kVvKRFqR4F3R3Z9Y7W9Y7E=
 Public:  6B8CHk2KNqRFqR4F3R3Z9Y7W9Y7EGJQTOLmY7Z7EpqG=
 ```
 
-### In Code (pseudo-code):
-```javascript
-// You'll need a WireGuard key generation library
-// Or shell out to 'wg genkey' and 'wg pubkey'
+---
 
-const privateKey = generateWireGuardPrivateKey();
-const publicKey = derivePublicKey(privateKey);
-```
+### Key Generation Summary
+
+| Method | Pros | Cons |
+|--------|------|------|
+| **WireGuard CLI** | Simple, guaranteed compatible | Requires WireGuard tools installed |
+| **OpenSSL** | Available on most systems | Requires OpenSSL 1.1.0+ |
+| **C# NSec** | Clean API, type-safe | External dependency |
+| **C# .NET Native** | No dependencies (.NET 7+) | Newer .NET version required |
+| **C# BouncyCastle** | Works on older .NET | Larger dependency |
 
 ---
 

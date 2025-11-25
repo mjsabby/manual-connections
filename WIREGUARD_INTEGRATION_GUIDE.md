@@ -193,9 +193,11 @@ echo "Public Key:  $PUBLIC_KEY"
 
 ---
 
-### Method 3: Using C# with Built-in .NET Cryptography
+### Method 3: Using C# with Built-in .NET Cryptography (Windows Only)
 
 C# can generate WireGuard keys using the built-in `ECDiffieHellman` class with Curve25519 support. This is the simplest approach with zero external dependencies.
+
+**Note:** Curve25519 support in `ECDiffieHellman` is only available on Windows. On Linux/macOS, you'll need to use OpenSSL or a library like BouncyCastle.
 
 #### Complete .NET Implementation:
 
@@ -437,8 +439,8 @@ Public:  6B8CHk2KNqRFqR4F3R3Z9Y7W9Y7EpqG=
 | Method | Pros | Cons |
 |--------|------|------|
 | **WireGuard CLI** | Simple, guaranteed compatible | Requires WireGuard tools installed |
-| **OpenSSL** | Available on most systems | Requires OpenSSL 1.1.0+ |
-| **C# .NET** | Built-in, no dependencies, cross-platform | Requires .NET 5+ for Curve25519 |
+| **OpenSSL** | Available on most systems, cross-platform | Requires OpenSSL 1.1.0+ |
+| **C# .NET** | Built-in, no external dependencies, simple | Windows only, requires .NET 5+ |
 
 ---
 
